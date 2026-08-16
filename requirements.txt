@@ -2,3 +2,4 @@ streamlit>=1.38
 Pillow>=10.0
 opencv-python-headless>=4.9
 numpy>=1.26
+requests>=2.31

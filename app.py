@@ -1,11 +1,13 @@
 """
 Poster Tools
 ------------
-A simple password-protected webpage with three tools:
+A simple password-protected webpage with four tools:
   1. Wood Mockup — paste posters onto the wood background for listing photos.
   2. Resize for Print — resize posters to 11x17 or 13x19 for actual printing,
      upscaling (with light sharpening) if the source isn't high-res enough.
   3. Framed Mockup — warp posters into the framed wall photo for listing photos.
+  4. Poster Catalog — permanent, searchable storage of every poster design,
+     behind its own separate password.
 """
 
 import io
@@ -17,6 +19,7 @@ from PIL import Image
 from mockup_core import load_background, make_mockup, CANVAS_SIZE
 from resize_core import resize_for_print, PAGE_SIZES, UPSCALE_WARN_THRESHOLD
 from framed_core import load_room_background, make_framed_mockup
+import catalog_core
 
 st.set_page_config(page_title="Poster Tools", page_icon="🪵", layout="centered")
 
@@ -331,11 +334,183 @@ def framed_mockup_tab():
 
 
 # ---------------------------------------------------------------------------
+# Tab 4: Poster Catalog
+# ---------------------------------------------------------------------------
+def catalog_password_gate():
+    """Separate shared-password gate for the catalog, independent of the
+    main app password. Uses its own session_state key so unlocking the
+    catalog doesn't unlock/affect the rest of the app or vice versa."""
+    def entered():
+        if st.session_state.get("catalog_password") == st.secrets.get("CATALOG_PASSWORD", ""):
+            st.session_state["catalog_password_ok"] = True
+            del st.session_state["catalog_password"]
+        else:
+            st.session_state["catalog_password_ok"] = False
+
+    if st.session_state.get("catalog_password_ok"):
+        return True
+
+    st.text_input(
+        "Catalog password", type="password", on_change=entered, key="catalog_password"
+    )
+    if st.session_state.get("catalog_password_ok") is False:
+        st.error("Incorrect password.")
+    return False
+
+
+def _catalog_config():
+    repo = st.secrets.get("GITHUB_REPO", "")
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    branch = st.secrets.get("GITHUB_BRANCH", "main")
+    return repo, token, branch
+
+
+def _load_catalog_entries(repo, token, branch, force=False):
+    if force or "catalog_entries" not in st.session_state:
+        try:
+            entries, sha = catalog_core.get_index(repo, token, branch)
+            st.session_state["catalog_entries"] = entries
+            st.session_state["catalog_sha"] = sha
+        except catalog_core.CatalogError as e:
+            st.error(str(e))
+            st.session_state["catalog_entries"] = st.session_state.get("catalog_entries", [])
+    return st.session_state.get("catalog_entries", [])
+
+
+def _get_image_bytes(repo, token, branch, path):
+    """Fetches + caches image bytes per path in session_state so switching
+    tabs / searching doesn't re-hit the GitHub API for every thumbnail on
+    every rerun."""
+    cache = st.session_state.setdefault("catalog_image_cache", {})
+    if path not in cache:
+        try:
+            cache[path] = catalog_core.fetch_image_bytes(repo, token, path, branch)
+        except catalog_core.CatalogError:
+            cache[path] = None
+    return cache[path]
+
+
+def catalog_tab():
+    if not catalog_password_gate():
+        return
+
+    repo, token, branch = _catalog_config()
+    if not repo or not token:
+        st.warning(
+            "The catalog isn't fully set up yet — it needs `GITHUB_REPO` and "
+            "`GITHUB_TOKEN` added under the app's Settings → Secrets."
+        )
+        return
+
+    st.write(
+        "Every poster added here is stored permanently and can be searched by "
+        "name or keyword. Add new designs below, or search and download "
+        "existing ones."
+    )
+
+    col_search, col_refresh = st.columns([4, 1])
+    with col_search:
+        query = st.text_input("Search by name or keyword", key="catalog_search")
+    with col_refresh:
+        st.write("")
+        st.write("")
+        if st.button("🔄 Refresh", key="catalog_refresh", width="stretch"):
+            _load_catalog_entries(repo, token, branch, force=True)
+            st.rerun()
+
+    entries = _load_catalog_entries(repo, token, branch)
+    results = catalog_core.search(entries, query)
+
+    st.caption(f"{len(results)} of {len(entries)} poster(s) shown.")
+
+    if results:
+        cols = st.columns(3)
+        ordered = sorted(results, key=lambda e: e.get("added", ""), reverse=True)
+        for idx, entry in enumerate(ordered):
+            col = cols[idx % 3]
+            with col:
+                img_bytes = _get_image_bytes(repo, token, branch, entry["path"])
+                if img_bytes:
+                    st.image(img_bytes, width="stretch")
+                else:
+                    st.caption("(image unavailable)")
+                st.markdown(f"**{entry['name']}**")
+                if entry.get("keywords"):
+                    st.caption(entry["keywords"])
+                st.caption(f"Added {entry.get('added', '?')}")
+
+                if img_bytes:
+                    st.download_button(
+                        "⬇️ Download",
+                        data=img_bytes,
+                        file_name=entry["path"].rsplit("/", 1)[-1],
+                        key=f"catalog_dl_{entry['id']}",
+                        width="stretch",
+                    )
+
+                confirm_key = f"catalog_confirm_delete_{entry['id']}"
+                if st.session_state.get(confirm_key):
+                    st.warning("Delete this poster permanently?")
+                    dcol1, dcol2 = st.columns(2)
+                    if dcol1.button("Yes, delete", key=f"catalog_delete_yes_{entry['id']}", width="stretch"):
+                        try:
+                            catalog_core.delete_poster(repo, token, entry, branch)
+                            st.session_state.get("catalog_image_cache", {}).pop(entry["path"], None)
+                            _load_catalog_entries(repo, token, branch, force=True)
+                            st.session_state[confirm_key] = False
+                            st.success(f"Deleted '{entry['name']}'.")
+                            st.rerun()
+                        except catalog_core.CatalogError as e:
+                            st.error(str(e))
+                    if dcol2.button("Cancel", key=f"catalog_delete_cancel_{entry['id']}", width="stretch"):
+                        st.session_state[confirm_key] = False
+                        st.rerun()
+                else:
+                    if st.button("🗑️ Delete", key=f"catalog_delete_{entry['id']}", width="stretch"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+
+                st.write("---")
+    else:
+        st.info("No posters match that search." if entries else "No posters in the catalog yet — add one below.")
+
+    st.divider()
+    st.subheader("Add a new poster")
+
+    with st.form("catalog_add_form", clear_on_submit=True):
+        new_file = st.file_uploader(
+            "Poster image", type=["png", "jpg", "jpeg", "webp"], key="catalog_new_file"
+        )
+        new_name = st.text_input("Name", key="catalog_new_name")
+        new_keywords = st.text_input(
+            "Keywords (comma-separated, optional)", key="catalog_new_keywords"
+        )
+        submitted = st.form_submit_button("Add to catalog", type="primary")
+
+        if submitted:
+            if not new_file or not new_name.strip():
+                st.error("Please provide both an image and a name.")
+            else:
+                try:
+                    catalog_core.add_poster(
+                        repo, token, new_name.strip(), new_keywords.strip(),
+                        new_file.getvalue(), new_file.name, branch,
+                    )
+                    _load_catalog_entries(repo, token, branch, force=True)
+                    st.success(f"Added '{new_name.strip()}' to the catalog.")
+                    st.rerun()
+                except catalog_core.CatalogError as e:
+                    st.error(str(e))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 st.title("Poster Tools")
 
-tab1, tab2, tab3 = st.tabs(["🪵 Wood Mockup", "📐 Resize for Print", "🖼️ Framed Mockup"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["🪵 Wood Mockup", "📐 Resize for Print", "🖼️ Framed Mockup", "🗂️ Poster Catalog"]
+)
 
 with tab1:
     wood_mockup_tab()
@@ -345,3 +520,6 @@ with tab2:
 
 with tab3:
     framed_mockup_tab()
+
+with tab4:
+    catalog_tab()
