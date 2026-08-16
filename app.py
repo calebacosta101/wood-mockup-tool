@@ -17,7 +17,7 @@ import streamlit as st
 from PIL import Image
 
 from mockup_core import load_background, make_mockup, CANVAS_SIZE
-from resize_core import resize_for_print, fit_cover_for_print, PAGE_SIZES, UPSCALE_WARN_THRESHOLD
+from resize_core import resize_for_print, fit_cover_for_print, PAGE_SIZES, UPSCALE_WARN_THRESHOLD, PRINT_DPI
 from framed_core import load_room_background, make_framed_mockup
 import catalog_core
 
@@ -62,6 +62,17 @@ def build_zip(files):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in files:
             zf.writestr(name, data)
+    buf.seek(0)
+    return buf
+
+
+def build_pdf(files, dpi=PRINT_DPI):
+    """Combines a list of (name, jpeg_bytes) into a single multi-page PDF,
+    one page per image, at the given resolution — ready for batch printing."""
+    pages = [Image.open(io.BytesIO(data)).convert("RGB") for _, data in files]
+    buf = io.BytesIO()
+    first, rest = pages[0], pages[1:]
+    first.save(buf, "PDF", resolution=dpi, save_all=True, append_images=rest)
     buf.seek(0)
     return buf
 
@@ -217,14 +228,25 @@ def resize_tab():
                     "had to be stretched up:\n\n" + lines
                 )
 
+            dl_col1, dl_col2 = st.columns(2)
             zip_buffer = build_zip(results)
-            st.download_button(
+            dl_col1.download_button(
                 "⬇️ Download all as ZIP",
                 data=zip_buffer,
                 file_name=f"resized_{size_key}.zip",
                 mime="application/zip",
                 type="primary",
                 key="resize_download",
+                width="stretch",
+            )
+            pdf_buffer = build_pdf(results)
+            dl_col2.download_button(
+                "📄 Download all as PDF",
+                data=pdf_buffer,
+                file_name=f"resized_{size_key}_print_batch.pdf",
+                mime="application/pdf",
+                key="resize_download_pdf",
+                width="stretch",
             )
 
             st.write("Preview:")

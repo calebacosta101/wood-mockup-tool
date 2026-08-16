@@ -73,6 +73,28 @@ def _save_index(repo, token, entries, sha, branch="main", message="Update catalo
     return resp.json()["content"]["sha"]
 
 
+def _mutate_index_with_retry(repo, token, branch, mutate_fn, message, max_attempts=3):
+    """Fetches the current index, applies mutate_fn(entries) -> entries,
+    and saves it. GitHub's Contents API can occasionally serve a GET that's
+    a beat behind the very latest write (e.g. renaming a poster moments
+    after adding it) — that shows up as a 409 "sha does not match" on the
+    save. When that happens, re-fetch a fresh copy and retry rather than
+    failing outright."""
+    last_err = None
+    for attempt in range(max_attempts):
+        entries, sha = get_index(repo, token, branch)
+        mutated = mutate_fn(entries)
+        try:
+            _save_index(repo, token, mutated, sha, branch, message=message)
+            return mutated
+        except CatalogError as e:
+            last_err = e
+            if "(409)" not in str(e) or attempt == max_attempts - 1:
+                raise
+            # sha conflict — loop around and retry with a freshly read sha
+    raise last_err
+
+
 def guess_name_from_filename(filename):
     """Turns 'sunset_beach-v2.png' into 'Sunset Beach V2' as a friendly
     default name for bulk uploads — the user can always rename it after."""
@@ -118,14 +140,16 @@ def add_posters_bulk(repo, token, items, branch="main"):
             "added": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         })
 
-    entries, sha = get_index(repo, token, branch)
-    entries.extend(new_entries)
     message = (
         f"Add poster to index: {new_entries[0]['name']}"
         if len(new_entries) == 1
         else f"Add {len(new_entries)} posters to index"
     )
-    _save_index(repo, token, entries, sha, branch, message=message)
+    _mutate_index_with_retry(
+        repo, token, branch,
+        mutate_fn=lambda entries: entries + new_entries,
+        message=message,
+    )
     return new_entries
 
 
@@ -145,20 +169,25 @@ def update_poster(repo, token, entry_id, new_name, new_keywords, branch="main"):
     """Renames a poster and/or updates its keywords. Only the index
     metadata changes — the underlying image file and its path are left
     exactly where they are. Returns the updated entry."""
-    entries, sha = get_index(repo, token, branch)
-    updated = None
-    for e in entries:
-        if e["id"] == entry_id:
-            e["name"] = new_name
-            e["keywords"] = new_keywords
-            updated = e
-            break
-    if updated is None:
-        raise CatalogError(
-            "That poster couldn't be found — it may have already been deleted. Try refreshing."
-        )
-    _save_index(repo, token, entries, sha, branch, message=f"Rename poster: {new_name}")
-    return updated
+    result_holder = {}
+
+    def mutate(entries):
+        updated = None
+        for e in entries:
+            if e["id"] == entry_id:
+                e["name"] = new_name
+                e["keywords"] = new_keywords
+                updated = e
+                break
+        if updated is None:
+            raise CatalogError(
+                "That poster couldn't be found — it may have already been deleted. Try refreshing."
+            )
+        result_holder["entry"] = updated
+        return entries
+
+    _mutate_index_with_retry(repo, token, branch, mutate, message=f"Rename poster: {new_name}")
+    return result_holder["entry"]
 
 
 def delete_poster(repo, token, entry, branch="main"):
@@ -172,9 +201,11 @@ def delete_poster(repo, token, entry, branch="main"):
         del_body = {"message": f"Remove poster: {entry['name']}", "sha": file_sha, "branch": branch}
         requests.delete(_repo_url(repo, entry["path"]), headers=_headers(token), json=del_body, timeout=30)
 
-    entries, sha = get_index(repo, token, branch)
-    entries = [e for e in entries if e["id"] != entry["id"]]
-    _save_index(repo, token, entries, sha, branch, message=f"Remove from index: {entry['name']}")
+    _mutate_index_with_retry(
+        repo, token, branch,
+        mutate_fn=lambda entries: [e for e in entries if e["id"] != entry["id"]],
+        message=f"Remove from index: {entry['name']}",
+    )
 
 
 def image_raw_url(repo, path, branch="main"):
