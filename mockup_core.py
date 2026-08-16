@@ -4,7 +4,8 @@ Shared by the Streamlit app and can be run standalone for testing.
 """
 
 from PIL import Image, ImageFilter, ImageDraw
-import io
+
+from imaging import cover_crop
 
 # --- Frame placement, measured from the sample mockup you provided ---
 # (as fractions of the canvas, so it scales to any output resolution)
@@ -20,26 +21,6 @@ CANVAS_SIZE = 2000
 SHADOW_BLUR = 26
 SHADOW_OFFSET = (10, 22)   # (x, y) — shadow drifts slightly down-right
 SHADOW_OPACITY = 90        # 0-255
-
-
-def cover_crop(img, target_w, target_h):
-    """Resize `img` to completely fill target_w x target_h, cropping the overflow
-    from the center. Guarantees no gaps/borders, regardless of aspect ratio."""
-    src_w, src_h = img.size
-    src_ratio = src_w / src_h
-    target_ratio = target_w / target_h
-
-    if src_ratio > target_ratio:
-        new_h = target_h
-        new_w = max(target_w, round(src_ratio * new_h))
-    else:
-        new_w = target_w
-        new_h = max(target_h, round(new_w / src_ratio))
-
-    resized = img.resize((new_w, new_h), Image.LANCZOS)
-    left = (new_w - target_w) // 2
-    top = (new_h - target_h) // 2
-    return resized.crop((left, top, left + target_w, top + target_h))
 
 
 def load_background(bg_path, canvas_size=CANVAS_SIZE):
