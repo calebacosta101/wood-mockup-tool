@@ -34,3 +34,33 @@ def required_upscale_factor(img, target_w, target_h):
     scale_w = target_w / src_w
     scale_h = target_h / src_h
     return max(scale_w, scale_h)
+
+
+def contain_fit(img, target_w, target_h, bg_color=(255, 255, 255)):
+    """Resize `img` to fit entirely within target_w x target_h WITHOUT
+    cropping any part of it — the whole design stays in view. Preserves
+    aspect ratio and pads any leftover space (when the source proportions
+    don't exactly match the target) with bg_color so the result is exactly
+    target_w x target_h. Upscales (via LANCZOS) if the source is smaller
+    than the target."""
+    src_w, src_h = img.size
+    scale = min(target_w / src_w, target_h / src_h)
+    new_w = max(1, round(src_w * scale))
+    new_h = max(1, round(src_h * scale))
+
+    resized = img.resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new("RGB", (target_w, target_h), bg_color)
+    left = (target_w - new_w) // 2
+    top = (target_h - new_h) // 2
+    canvas.paste(resized, (left, top))
+    return canvas
+
+
+def required_contain_scale_factor(img, target_w, target_h):
+    """How much the image must be scaled up to fit inside the target box
+    via contain-fit — i.e. the limiting dimension's scale factor (the
+    smaller of the two). <= 1.0 means no upscaling is needed."""
+    src_w, src_h = img.size
+    scale_w = target_w / src_w
+    scale_h = target_h / src_h
+    return min(scale_w, scale_h)

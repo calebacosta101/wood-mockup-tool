@@ -73,33 +73,92 @@ def _save_index(repo, token, entries, sha, branch="main", message="Update catalo
     return resp.json()["content"]["sha"]
 
 
-def add_poster(repo, token, name, keywords, image_bytes, orig_filename, branch="main"):
-    """Uploads the image and appends a new entry to the index. Returns the new entry."""
-    ext = orig_filename.rsplit(".", 1)[-1].lower() if "." in orig_filename else "jpg"
-    poster_id = uuid.uuid4().hex[:10]
-    slug = _slugify(name)
-    image_path = f"{IMAGES_DIR}/{slug}-{poster_id}.{ext}"
+def guess_name_from_filename(filename):
+    """Turns 'sunset_beach-v2.png' into 'Sunset Beach V2' as a friendly
+    default name for bulk uploads — the user can always rename it after."""
+    base = filename.rsplit(".", 1)[0] if "." in filename else filename
+    base = re.sub(r"[_\-]+", " ", base).strip()
+    base = re.sub(r"\s+", " ", base)
+    return base.title() if base else "Untitled Poster"
 
-    put_body = {
-        "message": f"Add poster: {name}",
-        "content": base64.b64encode(image_bytes).decode("ascii"),
-        "branch": branch,
-    }
-    resp = requests.put(_repo_url(repo, image_path), headers=_headers(token), json=put_body, timeout=60)
-    if not resp.ok:
-        raise CatalogError(f"Couldn't upload image ({resp.status_code}): {resp.text[:300]}")
+
+def add_posters_bulk(repo, token, items, branch="main"):
+    """Uploads multiple images and appends all of them to the index in a
+    single index save (one commit for the index, regardless of how many
+    images), rather than re-reading/re-saving the index once per image.
+
+    `items` is a list of dicts: {name, keywords, image_bytes, orig_filename}.
+    Returns the list of new entries, in the same order as `items`.
+    """
+    new_entries = []
+    for item in items:
+        orig_filename = item["orig_filename"]
+        name = item["name"]
+        ext = orig_filename.rsplit(".", 1)[-1].lower() if "." in orig_filename else "jpg"
+        poster_id = uuid.uuid4().hex[:10]
+        slug = _slugify(name)
+        image_path = f"{IMAGES_DIR}/{slug}-{poster_id}.{ext}"
+
+        put_body = {
+            "message": f"Add poster: {name}",
+            "content": base64.b64encode(item["image_bytes"]).decode("ascii"),
+            "branch": branch,
+        }
+        resp = requests.put(_repo_url(repo, image_path), headers=_headers(token), json=put_body, timeout=60)
+        if not resp.ok:
+            raise CatalogError(
+                f"Couldn't upload '{orig_filename}' ({resp.status_code}): {resp.text[:300]}"
+            )
+
+        new_entries.append({
+            "id": poster_id,
+            "name": name,
+            "keywords": item.get("keywords", ""),
+            "path": image_path,
+            "added": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        })
 
     entries, sha = get_index(repo, token, branch)
-    entry = {
-        "id": poster_id,
+    entries.extend(new_entries)
+    message = (
+        f"Add poster to index: {new_entries[0]['name']}"
+        if len(new_entries) == 1
+        else f"Add {len(new_entries)} posters to index"
+    )
+    _save_index(repo, token, entries, sha, branch, message=message)
+    return new_entries
+
+
+def add_poster(repo, token, name, keywords, image_bytes, orig_filename, branch="main"):
+    """Convenience wrapper around add_posters_bulk for a single poster.
+    Returns the new entry."""
+    items = [{
         "name": name,
         "keywords": keywords,
-        "path": image_path,
-        "added": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-    }
-    entries.append(entry)
-    _save_index(repo, token, entries, sha, branch, message=f"Add poster to index: {name}")
-    return entry
+        "image_bytes": image_bytes,
+        "orig_filename": orig_filename,
+    }]
+    return add_posters_bulk(repo, token, items, branch)[0]
+
+
+def update_poster(repo, token, entry_id, new_name, new_keywords, branch="main"):
+    """Renames a poster and/or updates its keywords. Only the index
+    metadata changes — the underlying image file and its path are left
+    exactly where they are. Returns the updated entry."""
+    entries, sha = get_index(repo, token, branch)
+    updated = None
+    for e in entries:
+        if e["id"] == entry_id:
+            e["name"] = new_name
+            e["keywords"] = new_keywords
+            updated = e
+            break
+    if updated is None:
+        raise CatalogError(
+            "That poster couldn't be found — it may have already been deleted. Try refreshing."
+        )
+    _save_index(repo, token, entries, sha, branch, message=f"Rename poster: {new_name}")
+    return updated
 
 
 def delete_poster(repo, token, entry, branch="main"):
