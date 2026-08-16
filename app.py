@@ -1,10 +1,11 @@
 """
 Poster Tools
 ------------
-A simple password-protected webpage with two tools:
+A simple password-protected webpage with three tools:
   1. Wood Mockup — paste posters onto the wood background for listing photos.
   2. Resize for Print — resize posters to 11x17 or 13x19 for actual printing,
      upscaling (with light sharpening) if the source isn't high-res enough.
+  3. Framed Mockup — warp posters into the framed wall photo for listing photos.
 """
 
 import io
@@ -15,10 +16,12 @@ from PIL import Image
 
 from mockup_core import load_background, make_mockup, CANVAS_SIZE
 from resize_core import resize_for_print, PAGE_SIZES, UPSCALE_WARN_THRESHOLD
+from framed_core import load_room_background, make_framed_mockup
 
 st.set_page_config(page_title="Poster Tools", page_icon="🪵", layout="centered")
 
 BACKGROUND_PATH = "wood_background.jpg"
+ROOM_BACKGROUND_PATH = "room_background.png"
 
 
 # ---------------------------------------------------------------------------
@@ -229,14 +232,116 @@ def resize_tab():
 
 
 # ---------------------------------------------------------------------------
+# Tab 3: Framed Mockup
+# ---------------------------------------------------------------------------
+def framed_mockup_tab():
+    st.write(
+        "Upload your poster images below. Each one is fit to the chosen print "
+        "size (upscaled and lightly sharpened if needed, same as the Resize "
+        "tool) and warped into the frame on the wall photo — including its "
+        "slight camera-angle tilt, so it sits naturally instead of looking "
+        "pasted flat on top."
+    )
+
+    size_key = st.radio(
+        "Poster size",
+        options=list(PAGE_SIZES.keys()),
+        horizontal=True,
+        key="framed_size",
+    )
+
+    uploaded_files = st.file_uploader(
+        "Poster images",
+        type=["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp"],
+        accept_multiple_files=True,
+        key="framed_uploader",
+    )
+
+    quality = st.slider(
+        "JPEG quality (higher = bigger file, better quality)",
+        min_value=70, max_value=100, value=92,
+        key="framed_quality",
+    )
+
+    if uploaded_files:
+        st.write(f"{len(uploaded_files)} image(s) ready.")
+
+        if st.button("Generate framed mockups", type="primary", key="framed_generate"):
+            progress = st.progress(0.0, text="Starting...")
+            background = load_room_background(ROOM_BACKGROUND_PATH)
+
+            results = []
+            warnings = []
+            for i, uf in enumerate(uploaded_files):
+                try:
+                    poster = Image.open(uf)
+                    # bring it to true print dimensions first (with upscale +
+                    # sharpen if needed), then warp that into the frame
+                    fitted, factor = resize_for_print(poster, size_key)
+                    framed = make_framed_mockup(fitted, background)
+
+                    out_buf = io.BytesIO()
+                    framed.save(out_buf, "JPEG", quality=quality, optimize=True)
+                    out_buf.seek(0)
+
+                    base_name = uf.name.rsplit(".", 1)[0]
+                    out_name = f"{base_name}_framed.jpg"
+                    results.append((out_name, out_buf.getvalue()))
+
+                    if factor > UPSCALE_WARN_THRESHOLD:
+                        warnings.append((uf.name, factor))
+                except Exception as e:
+                    st.warning(f"Skipped {uf.name}: {e}")
+
+                progress.progress(
+                    (i + 1) / len(uploaded_files),
+                    text=f"Processed {i + 1} of {len(uploaded_files)}",
+                )
+
+            st.success(f"Done! {len(results)} framed mockup(s) generated.")
+
+            if warnings:
+                lines = "\n".join(
+                    f"- **{name}** — upscaled {factor:.1f}x, may look soft up close"
+                    for name, factor in warnings
+                )
+                st.warning(
+                    "These source images were smaller than the chosen print size "
+                    "and had to be stretched up:\n\n" + lines
+                )
+
+            zip_buffer = build_zip(results)
+            st.download_button(
+                "⬇️ Download all as ZIP",
+                data=zip_buffer,
+                file_name="framed_mockups.zip",
+                mime="application/zip",
+                type="primary",
+                key="framed_download",
+            )
+
+            st.write("Preview:")
+            cols = st.columns(3)
+            for idx, (name, data) in enumerate(results[:9]):
+                cols[idx % 3].image(data, caption=name, width="stretch")
+            if len(results) > 9:
+                st.caption(f"...and {len(results) - 9} more in the zip.")
+    else:
+        st.info("Upload one or more images to get started.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 st.title("Poster Tools")
 
-tab1, tab2 = st.tabs(["🪵 Wood Mockup", "📐 Resize for Print"])
+tab1, tab2, tab3 = st.tabs(["🪵 Wood Mockup", "📐 Resize for Print", "🖼️ Framed Mockup"])
 
 with tab1:
     wood_mockup_tab()
 
 with tab2:
     resize_tab()
+
+with tab3:
+    framed_mockup_tab()
