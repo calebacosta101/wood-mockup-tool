@@ -64,3 +64,12 @@ def required_contain_scale_factor(img, target_w, target_h):
     scale_w = target_w / src_w
     scale_h = target_h / src_h
     return min(scale_w, scale_h)
+
+
+def stretch_fit(img, target_w, target_h):
+    """Resizes `img` to exactly target_w x target_h by scaling width and
+    height independently — completely fills the page with ZERO cropping
+    and ZERO padding/border. The tradeoff: if the source proportions don't
+    already match the target, the image is stretched slightly out of its
+    original aspect ratio to make it fit exactly."""
+    return img.resize((target_w, target_h), Image.LANCZOS)

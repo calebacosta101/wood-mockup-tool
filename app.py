@@ -155,14 +155,14 @@ def wood_mockup_tab():
 # ---------------------------------------------------------------------------
 def resize_tab():
     st.write(
-        "Upload your poster images below. Each one gets resized to fit the "
-        "page at print resolution with the full design always in view — "
-        "nothing gets cropped off. If a source image's proportions don't "
-        "exactly match the page size, a thin white margin fills the "
-        "leftover space instead. If a source image is too low-res for a "
-        "crisp print at that size, it's automatically upscaled and "
-        "lightly sharpened — and flagged below so you know which ones to "
-        "double check."
+        "Upload your poster images below. Each one gets resized to "
+        "completely fill the page at print resolution — no cropping, and "
+        "no white border either. If a source image's proportions don't "
+        "already match the page size exactly, it's stretched slightly to "
+        "fit edge-to-edge rather than cropped or padded. If a source "
+        "image is too low-res for a crisp print at that size, it's "
+        "automatically upscaled and lightly sharpened — and flagged "
+        "below so you know which ones to double check."
     )
 
     size_key = st.radio(

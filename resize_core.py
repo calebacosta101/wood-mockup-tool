@@ -1,19 +1,15 @@
 """
-Core logic for the "Resize for Print" tool: fits posters onto an 11x17 or
-13x19 inch page at print resolution WITHOUT cropping any part of the
-design — if the source proportions don't exactly match the page, a thin
-white margin fills the leftover space instead. Also gently sharpens
-images that had to be upscaled to reach print resolution.
+Core logic for the "Resize for Print" tool: resizes posters to exactly
+fill an 11x17 or 13x19 inch page at print resolution — no cropping, and
+no white border/padding either. If the source image's proportions don't
+already match the page, it's stretched slightly (width and height scaled
+independently) to fit perfectly, rather than cropping or padding. Also
+gently sharpens images that had to be upscaled to reach print resolution.
 """
 
 from PIL import Image, ImageFilter
 
-from imaging import (
-    cover_crop,
-    contain_fit,
-    required_upscale_factor,
-    required_contain_scale_factor,
-)
+from imaging import cover_crop, stretch_fit, required_upscale_factor
 
 PRINT_DPI = 300
 
@@ -47,14 +43,14 @@ def _sharpen_if_upscaled(img, factor):
 
 def resize_for_print(poster_path_or_image, size_key, dpi=PRINT_DPI):
     """
-    Fits the whole design onto the page with NO cropping — the full
-    artwork always stays in view. If its proportions don't exactly match
-    the page size, a thin white margin is added on two sides rather than
-    cutting off any part of the image.
+    Resizes the poster to exactly fill the page — NO cropping, and NO
+    white border either. If the source proportions don't already match
+    the page, it's stretched (width/height scaled independently) just
+    enough to fit perfectly edge-to-edge.
 
     Returns (result_image, upscale_factor). upscale_factor > 1 means the
-    source was smaller than the print target and had to be stretched up
-    by that much to fit the page.
+    source was smaller than the print target and had to be scaled up by
+    that much (in its more demanding dimension) to fill the page.
     """
     if isinstance(poster_path_or_image, Image.Image):
         img = poster_path_or_image.convert("RGB")
@@ -62,9 +58,9 @@ def resize_for_print(poster_path_or_image, size_key, dpi=PRINT_DPI):
         img = Image.open(poster_path_or_image).convert("RGB")
 
     target_w, target_h = target_pixels(size_key, dpi)
-    factor = required_contain_scale_factor(img, target_w, target_h)
+    factor = required_upscale_factor(img, target_w, target_h)
 
-    result = contain_fit(img, target_w, target_h)
+    result = stretch_fit(img, target_w, target_h)
     result = _sharpen_if_upscaled(result, factor)
 
     return result, factor
