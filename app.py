@@ -20,8 +20,10 @@ from mockup_core import load_background, make_mockup, CANVAS_SIZE
 from resize_core import resize_for_print, fit_cover_for_print, PAGE_SIZES, UPSCALE_WARN_THRESHOLD, PRINT_DPI
 from framed_core import load_room_background, make_framed_mockup
 import catalog_core
+import theme
 
 st.set_page_config(page_title="Poster Tools", page_icon="🪵", layout="centered")
+theme.inject()
 
 BACKGROUND_PATH = "wood_background.jpg"
 ROOM_BACKGROUND_PATH = "room_background.png"
@@ -598,7 +600,8 @@ def catalog_tab():
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-st.title("Poster Tools")
+theme.eyebrow("POSTER TOOLS · UTILITIES")
+st.title("Print & mockup toolkit")
 
 tab1, tab2, tab3, tab4 = st.tabs(
     ["🪵 Wood Mockup", "📐 Resize for Print", "🖼️ Framed Mockup", "🗂️ Poster Catalog"]
