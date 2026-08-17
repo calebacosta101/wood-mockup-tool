@@ -216,13 +216,24 @@ def image_raw_url(repo, path, branch="main"):
 
 
 def fetch_image_bytes(repo, token, path, branch="main"):
+    """Fetches the raw bytes of a file in the repo. Requests the "raw"
+    media type instead of the default JSON+base64 response — GitHub's
+    Contents API only inlines base64 content for files under ~1MB; above
+    that, the default response silently comes back with an empty content
+    field instead of an error. Full-resolution poster images routinely
+    exceed 1MB, so without this the image would just quietly fail to load.
+    The raw media type works for files up to 100MB."""
+    headers = _headers(token)
+    headers["Accept"] = "application/vnd.github.raw+json"
     resp = requests.get(
-        _repo_url(repo, path), headers=_headers(token),
+        _repo_url(repo, path), headers=headers,
         params={"ref": branch}, timeout=30,
     )
     if not resp.ok:
         raise CatalogError(f"Couldn't load image ({resp.status_code})")
-    return base64.b64decode(resp.json()["content"])
+    if not resp.content:
+        raise CatalogError("Image file appears to be empty or unreadable at that size.")
+    return resp.content
 
 
 def search(entries, query):
