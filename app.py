@@ -118,8 +118,9 @@ def wood_mockup_tab():
 
             results = []
             stopped_early = False
+            budget = memory_guard.BatchBudget()
             for i, uf in enumerate(uploaded_files):
-                if memory_guard.over_limit():
+                if budget.over_limit():
                     stopped_early = True
                     break
                 try:
@@ -141,7 +142,14 @@ def wood_mockup_tab():
                     text=f"Processed {i + 1} of {len(uploaded_files)}",
                 )
 
-            if stopped_early:
+            if stopped_early and not results:
+                st.error(
+                    "Stopped before finishing a single image — this app's memory was "
+                    "already high, likely from earlier activity in this session. "
+                    "Reload the page (this clears that) and try again, ideally with "
+                    "a smaller batch."
+                )
+            elif stopped_early:
                 st.error(
                     f"Stopped after {len(results)} of {len(uploaded_files)} images — "
                     "this batch was approaching the app's memory limit. Download what's "
@@ -150,22 +158,23 @@ def wood_mockup_tab():
             else:
                 st.success(f"Done! {len(results)} mockup(s) generated.")
 
-            zip_buffer = build_zip(results)
-            st.download_button(
-                "⬇️ Download all as ZIP",
-                data=zip_buffer,
-                file_name="wood_mockups.zip",
-                mime="application/zip",
-                type="primary",
-                key="mockup_download",
-            )
+            if results:
+                zip_buffer = build_zip(results)
+                st.download_button(
+                    "⬇️ Download all as ZIP",
+                    data=zip_buffer,
+                    file_name="wood_mockups.zip",
+                    mime="application/zip",
+                    type="primary",
+                    key="mockup_download",
+                )
 
-            st.write("Preview:")
-            cols = st.columns(3)
-            for idx, (name, data) in enumerate(results[:9]):
-                cols[idx % 3].image(data, caption=name, width="stretch")
-            if len(results) > 9:
-                st.caption(f"...and {len(results) - 9} more in the zip.")
+                st.write("Preview:")
+                cols = st.columns(3)
+                for idx, (name, data) in enumerate(results[:9]):
+                    cols[idx % 3].image(data, caption=name, width="stretch")
+                if len(results) > 9:
+                    st.caption(f"...and {len(results) - 9} more in the zip.")
     else:
         st.info("Upload one or more images to get started.")
 
@@ -226,8 +235,9 @@ def resize_tab():
             results = []
             warnings = []
             stopped_early = False
+            budget = memory_guard.BatchBudget()
             for i, uf in enumerate(uploaded_files):
-                if memory_guard.over_limit():
+                if budget.over_limit():
                     stopped_early = True
                     break
                 try:
@@ -267,7 +277,14 @@ def resize_tab():
         used_size_key = st.session_state["resize_size_key"]
         total_uploaded = st.session_state["resize_total_uploaded"]
 
-        if st.session_state["resize_stopped_early"]:
+        if st.session_state["resize_stopped_early"] and not results:
+            st.error(
+                "Stopped before finishing a single image — this app's memory was "
+                "already high, likely from earlier activity in this session. Reload "
+                "the page (this clears that) and try again, ideally with a smaller "
+                "batch."
+            )
+        elif st.session_state["resize_stopped_early"]:
             st.error(
                 f"Stopped after {len(results)} of {total_uploaded} images — this batch "
                 "was approaching the app's memory limit. Download what's finished below, "
@@ -286,59 +303,62 @@ def resize_tab():
                 "had to be stretched up:\n\n" + lines
             )
 
-        # ZIP and PDF are built lazily, one at a time, on request — building
-        # both eagerly (the old behavior) meant holding three full copies of
-        # the batch in memory at once (resized images + zip + pdf), which is
-        # exactly what large batches don't have room for.
-        dl_col1, dl_col2 = st.columns(2)
+        if results:
+            # ZIP and PDF are built lazily, one at a time, on request —
+            # building both eagerly (the old behavior) meant holding three
+            # full copies of the batch in memory at once (resized images +
+            # zip + pdf), which is exactly what large batches don't have
+            # room for.
+            dl_col1, dl_col2 = st.columns(2)
 
-        with dl_col1:
-            if "resize_zip_bytes" in st.session_state:
-                st.download_button(
-                    "⬇️ Download all as ZIP",
-                    data=st.session_state["resize_zip_bytes"],
-                    file_name=f"resized_{used_size_key}.zip",
-                    mime="application/zip",
-                    type="primary",
-                    key="resize_download",
-                    width="stretch",
+            with dl_col1:
+                if "resize_zip_bytes" in st.session_state:
+                    st.download_button(
+                        "⬇️ Download all as ZIP",
+                        data=st.session_state["resize_zip_bytes"],
+                        file_name=f"resized_{used_size_key}.zip",
+                        mime="application/zip",
+                        type="primary",
+                        key="resize_download",
+                        width="stretch",
+                    )
+                elif st.button("📦 Prepare ZIP", key="resize_prep_zip", width="stretch"):
+                    # Keeping both a prepared ZIP and a prepared PDF cached
+                    # at once roughly doubles this step's memory cost for
+                    # no benefit on a big batch, so preparing one evicts
+                    # the other.
+                    st.session_state.pop("resize_pdf_bytes", None)
+                    st.session_state["resize_zip_bytes"] = build_zip(results).getvalue()
+                    st.rerun()
+
+            with dl_col2:
+                if "resize_pdf_bytes" in st.session_state:
+                    st.download_button(
+                        "⬇️ Download all as PDF",
+                        data=st.session_state["resize_pdf_bytes"],
+                        file_name=f"resized_{used_size_key}_print_batch.pdf",
+                        mime="application/pdf",
+                        key="resize_download_pdf",
+                        width="stretch",
+                    )
+                elif st.button("📄 Prepare PDF", key="resize_prep_pdf", width="stretch"):
+                    st.session_state.pop("resize_zip_bytes", None)
+                    st.session_state["resize_pdf_bytes"] = build_pdf(results).getvalue()
+                    st.rerun()
+
+            if len(results) > 35:
+                st.caption(
+                    "Large batch — preparing ZIP or PDF replaces whichever one was "
+                    "previously ready, to keep memory usage safe. Download one before "
+                    "preparing the other if you need both."
                 )
-            elif st.button("📦 Prepare ZIP", key="resize_prep_zip", width="stretch"):
-                # Keeping both a prepared ZIP and a prepared PDF cached at
-                # once roughly doubles this step's memory cost for no
-                # benefit on a big batch, so preparing one evicts the other.
-                st.session_state.pop("resize_pdf_bytes", None)
-                st.session_state["resize_zip_bytes"] = build_zip(results).getvalue()
-                st.rerun()
 
-        with dl_col2:
-            if "resize_pdf_bytes" in st.session_state:
-                st.download_button(
-                    "⬇️ Download all as PDF",
-                    data=st.session_state["resize_pdf_bytes"],
-                    file_name=f"resized_{used_size_key}_print_batch.pdf",
-                    mime="application/pdf",
-                    key="resize_download_pdf",
-                    width="stretch",
-                )
-            elif st.button("📄 Prepare PDF", key="resize_prep_pdf", width="stretch"):
-                st.session_state.pop("resize_zip_bytes", None)
-                st.session_state["resize_pdf_bytes"] = build_pdf(results).getvalue()
-                st.rerun()
-
-        if len(results) > 35:
-            st.caption(
-                "Large batch — preparing ZIP or PDF replaces whichever one was "
-                "previously ready, to keep memory usage safe. Download one before "
-                "preparing the other if you need both."
-            )
-
-        st.write("Preview:")
-        cols = st.columns(3)
-        for idx, (name, data) in enumerate(results[:9]):
-            cols[idx % 3].image(data, caption=name, width="stretch")
-        if len(results) > 9:
-            st.caption(f"...and {len(results) - 9} more in the zip.")
+            st.write("Preview:")
+            cols = st.columns(3)
+            for idx, (name, data) in enumerate(results[:9]):
+                cols[idx % 3].image(data, caption=name, width="stretch")
+            if len(results) > 9:
+                st.caption(f"...and {len(results) - 9} more in the zip.")
 
 
 # ---------------------------------------------------------------------------
@@ -383,8 +403,9 @@ def framed_mockup_tab():
             results = []
             warnings = []
             stopped_early = False
+            budget = memory_guard.BatchBudget()
             for i, uf in enumerate(uploaded_files):
-                if memory_guard.over_limit():
+                if budget.over_limit():
                     stopped_early = True
                     break
                 try:
@@ -413,7 +434,14 @@ def framed_mockup_tab():
                     text=f"Processed {i + 1} of {len(uploaded_files)}",
                 )
 
-            if stopped_early:
+            if stopped_early and not results:
+                st.error(
+                    "Stopped before finishing a single image — this app's memory was "
+                    "already high, likely from earlier activity in this session. "
+                    "Reload the page (this clears that) and try again, ideally with "
+                    "a smaller batch."
+                )
+            elif stopped_early:
                 st.error(
                     f"Stopped after {len(results)} of {len(uploaded_files)} images — "
                     "this batch was approaching the app's memory limit. Download what's "
@@ -432,22 +460,23 @@ def framed_mockup_tab():
                     "and had to be stretched up:\n\n" + lines
                 )
 
-            zip_buffer = build_zip(results)
-            st.download_button(
-                "⬇️ Download all as ZIP",
-                data=zip_buffer,
-                file_name="framed_mockups.zip",
-                mime="application/zip",
-                type="primary",
-                key="framed_download",
-            )
+            if results:
+                zip_buffer = build_zip(results)
+                st.download_button(
+                    "⬇️ Download all as ZIP",
+                    data=zip_buffer,
+                    file_name="framed_mockups.zip",
+                    mime="application/zip",
+                    type="primary",
+                    key="framed_download",
+                )
 
-            st.write("Preview:")
-            cols = st.columns(3)
-            for idx, (name, data) in enumerate(results[:9]):
-                cols[idx % 3].image(data, caption=name, width="stretch")
-            if len(results) > 9:
-                st.caption(f"...and {len(results) - 9} more in the zip.")
+                st.write("Preview:")
+                cols = st.columns(3)
+                for idx, (name, data) in enumerate(results[:9]):
+                    cols[idx % 3].image(data, caption=name, width="stretch")
+                if len(results) > 9:
+                    st.caption(f"...and {len(results) - 9} more in the zip.")
     else:
         st.info("Upload one or more images to get started.")
 
