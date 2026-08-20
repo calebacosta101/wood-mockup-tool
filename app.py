@@ -13,6 +13,7 @@ A simple password-protected webpage with four tools:
 import io
 import zipfile
 
+import img2pdf
 import streamlit as st
 from PIL import Image
 
@@ -20,6 +21,8 @@ from mockup_core import load_background, make_mockup, CANVAS_SIZE
 from resize_core import resize_for_print, fit_cover_for_print, PAGE_SIZES, UPSCALE_WARN_THRESHOLD, PRINT_DPI
 from framed_core import load_room_background, make_framed_mockup
 import catalog_core
+import memory_guard
+import shopify_publish
 import theme
 
 st.set_page_config(page_title="Poster Tools", page_icon="🪵", layout="centered")
@@ -70,13 +73,17 @@ def build_zip(files):
 
 def build_pdf(files, dpi=PRINT_DPI):
     """Combines a list of (name, jpeg_bytes) into a single multi-page PDF,
-    one page per image, at the given resolution — ready for batch printing."""
-    pages = [Image.open(io.BytesIO(data)).convert("RGB") for _, data in files]
-    buf = io.BytesIO()
-    first, rest = pages[0], pages[1:]
-    first.save(buf, "PDF", resolution=dpi, save_all=True, append_images=rest)
-    buf.seek(0)
-    return buf
+    one page per image, at the given resolution — ready for batch printing.
+
+    Uses img2pdf, which embeds the already-JPEG-encoded bytes directly into
+    the PDF without decoding them back to raw pixels. Decoding every page's
+    full print-resolution pixels at once (the previous Pillow-based
+    approach) held 2-3GB+ in memory on large batches, which is what was
+    crashing the app on Streamlit Cloud's memory limit.
+    """
+    layout_fun = img2pdf.get_fixed_dpi_layout_fun((dpi, dpi))
+    pdf_bytes = img2pdf.convert([data for _, data in files], layout_fun=layout_fun)
+    return io.BytesIO(pdf_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -110,7 +117,11 @@ def wood_mockup_tab():
             background = load_background(BACKGROUND_PATH, CANVAS_SIZE)
 
             results = []
+            stopped_early = False
             for i, uf in enumerate(uploaded_files):
+                if memory_guard.over_limit():
+                    stopped_early = True
+                    break
                 try:
                     poster = Image.open(uf)
                     mockup = make_mockup(poster, background, CANVAS_SIZE)
@@ -130,7 +141,14 @@ def wood_mockup_tab():
                     text=f"Processed {i + 1} of {len(uploaded_files)}",
                 )
 
-            st.success(f"Done! {len(results)} mockup(s) generated.")
+            if stopped_early:
+                st.error(
+                    f"Stopped after {len(results)} of {len(uploaded_files)} images — "
+                    "this batch was approaching the app's memory limit. Download what's "
+                    "finished below, then run the rest as a separate batch."
+                )
+            else:
+                st.success(f"Done! {len(results)} mockup(s) generated.")
 
             zip_buffer = build_zip(results)
             st.download_button(
@@ -187,15 +205,31 @@ def resize_tab():
         key="resize_quality",
     )
 
+    if not uploaded_files and "resize_results" not in st.session_state:
+        st.info("Upload one or more images to get started.")
+        return
+
     if uploaded_files:
         st.write(f"{len(uploaded_files)} image(s) ready.")
+
+        if len(uploaded_files) > 60:
+            st.info(
+                f"{len(uploaded_files)} images is a big batch. If this app runs low on "
+                "memory partway through, it'll stop and let you download what's finished "
+                "so far rather than losing the whole batch — but splitting into a few "
+                "smaller batches avoids that entirely."
+            )
 
         if st.button("Resize images", type="primary", key="resize_generate"):
             progress = st.progress(0.0, text="Starting...")
 
             results = []
             warnings = []
+            stopped_early = False
             for i, uf in enumerate(uploaded_files):
+                if memory_guard.over_limit():
+                    stopped_early = True
+                    break
                 try:
                     poster = Image.open(uf)
                     resized, factor = resize_for_print(poster, size_key)
@@ -218,47 +252,93 @@ def resize_tab():
                     text=f"Processed {i + 1} of {len(uploaded_files)}",
                 )
 
-            st.success(f"Done! {len(results)} image(s) resized to {size_key}in.")
+            st.session_state["resize_results"] = results
+            st.session_state["resize_warnings"] = warnings
+            st.session_state["resize_size_key"] = size_key
+            st.session_state["resize_stopped_early"] = stopped_early
+            st.session_state["resize_total_uploaded"] = len(uploaded_files)
+            # a fresh run invalidates any previously prepared downloads
+            st.session_state.pop("resize_zip_bytes", None)
+            st.session_state.pop("resize_pdf_bytes", None)
 
-            if warnings:
-                lines = "\n".join(
-                    f"- **{name}** — upscaled {factor:.1f}x, may look soft when printed"
-                    for name, factor in warnings
-                )
-                st.warning(
-                    "These source images were smaller than the print size and "
-                    "had to be stretched up:\n\n" + lines
-                )
+    if "resize_results" in st.session_state:
+        results = st.session_state["resize_results"]
+        warnings = st.session_state["resize_warnings"]
+        used_size_key = st.session_state["resize_size_key"]
+        total_uploaded = st.session_state["resize_total_uploaded"]
 
-            dl_col1, dl_col2 = st.columns(2)
-            zip_buffer = build_zip(results)
-            dl_col1.download_button(
-                "⬇️ Download all as ZIP",
-                data=zip_buffer,
-                file_name=f"resized_{size_key}.zip",
-                mime="application/zip",
-                type="primary",
-                key="resize_download",
-                width="stretch",
+        if st.session_state["resize_stopped_early"]:
+            st.error(
+                f"Stopped after {len(results)} of {total_uploaded} images — this batch "
+                "was approaching the app's memory limit. Download what's finished below, "
+                "then run the rest as a separate batch."
             )
-            pdf_buffer = build_pdf(results)
-            dl_col2.download_button(
-                "📄 Download all as PDF",
-                data=pdf_buffer,
-                file_name=f"resized_{size_key}_print_batch.pdf",
-                mime="application/pdf",
-                key="resize_download_pdf",
-                width="stretch",
+        else:
+            st.success(f"Done! {len(results)} image(s) resized to {used_size_key}in.")
+
+        if warnings:
+            lines = "\n".join(
+                f"- **{name}** — upscaled {factor:.1f}x, may look soft when printed"
+                for name, factor in warnings
+            )
+            st.warning(
+                "These source images were smaller than the print size and "
+                "had to be stretched up:\n\n" + lines
             )
 
-            st.write("Preview:")
-            cols = st.columns(3)
-            for idx, (name, data) in enumerate(results[:9]):
-                cols[idx % 3].image(data, caption=name, width="stretch")
-            if len(results) > 9:
-                st.caption(f"...and {len(results) - 9} more in the zip.")
-    else:
-        st.info("Upload one or more images to get started.")
+        # ZIP and PDF are built lazily, one at a time, on request — building
+        # both eagerly (the old behavior) meant holding three full copies of
+        # the batch in memory at once (resized images + zip + pdf), which is
+        # exactly what large batches don't have room for.
+        dl_col1, dl_col2 = st.columns(2)
+
+        with dl_col1:
+            if "resize_zip_bytes" in st.session_state:
+                st.download_button(
+                    "⬇️ Download all as ZIP",
+                    data=st.session_state["resize_zip_bytes"],
+                    file_name=f"resized_{used_size_key}.zip",
+                    mime="application/zip",
+                    type="primary",
+                    key="resize_download",
+                    width="stretch",
+                )
+            elif st.button("📦 Prepare ZIP", key="resize_prep_zip", width="stretch"):
+                # Keeping both a prepared ZIP and a prepared PDF cached at
+                # once roughly doubles this step's memory cost for no
+                # benefit on a big batch, so preparing one evicts the other.
+                st.session_state.pop("resize_pdf_bytes", None)
+                st.session_state["resize_zip_bytes"] = build_zip(results).getvalue()
+                st.rerun()
+
+        with dl_col2:
+            if "resize_pdf_bytes" in st.session_state:
+                st.download_button(
+                    "⬇️ Download all as PDF",
+                    data=st.session_state["resize_pdf_bytes"],
+                    file_name=f"resized_{used_size_key}_print_batch.pdf",
+                    mime="application/pdf",
+                    key="resize_download_pdf",
+                    width="stretch",
+                )
+            elif st.button("📄 Prepare PDF", key="resize_prep_pdf", width="stretch"):
+                st.session_state.pop("resize_zip_bytes", None)
+                st.session_state["resize_pdf_bytes"] = build_pdf(results).getvalue()
+                st.rerun()
+
+        if len(results) > 35:
+            st.caption(
+                "Large batch — preparing ZIP or PDF replaces whichever one was "
+                "previously ready, to keep memory usage safe. Download one before "
+                "preparing the other if you need both."
+            )
+
+        st.write("Preview:")
+        cols = st.columns(3)
+        for idx, (name, data) in enumerate(results[:9]):
+            cols[idx % 3].image(data, caption=name, width="stretch")
+        if len(results) > 9:
+            st.caption(f"...and {len(results) - 9} more in the zip.")
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +382,11 @@ def framed_mockup_tab():
 
             results = []
             warnings = []
+            stopped_early = False
             for i, uf in enumerate(uploaded_files):
+                if memory_guard.over_limit():
+                    stopped_early = True
+                    break
                 try:
                     poster = Image.open(uf)
                     # bring it to true print dimensions first (filling the
@@ -329,7 +413,14 @@ def framed_mockup_tab():
                     text=f"Processed {i + 1} of {len(uploaded_files)}",
                 )
 
-            st.success(f"Done! {len(results)} framed mockup(s) generated.")
+            if stopped_early:
+                st.error(
+                    f"Stopped after {len(results)} of {len(uploaded_files)} images — "
+                    "this batch was approaching the app's memory limit. Download what's "
+                    "finished below, then run the rest as a separate batch."
+                )
+            else:
+                st.success(f"Done! {len(results)} framed mockup(s) generated.")
 
             if warnings:
                 lines = "\n".join(
@@ -598,13 +689,93 @@ def catalog_tab():
 
 
 # ---------------------------------------------------------------------------
+# Tab 5: Shopify Listings
+# ---------------------------------------------------------------------------
+def _shopify_config():
+    shop_domain = st.secrets.get("SHOPIFY_SHOP_DOMAIN", "")
+    access_token = st.secrets.get("SHOPIFY_ACCESS_TOKEN", "")
+    return shop_domain, access_token
+
+
+def shopify_tab():
+    shop_domain, access_token = _shopify_config()
+    if not shop_domain or not access_token:
+        st.warning(
+            "Shopify isn't connected yet — this needs `SHOPIFY_SHOP_DOMAIN` and "
+            "`SHOPIFY_ACCESS_TOKEN` added under the app's Settings → Secrets. "
+            "Run `shopify_oauth_setup.py` locally once to get those values."
+        )
+        return
+
+    st.write(
+        "Upload the image(s) for a listing, fill in the details, and push it "
+        "straight to Shopify as a new product."
+    )
+
+    uploaded_files = st.file_uploader(
+        "Listing images (first one becomes the main product photo)",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key="shopify_uploader",
+    )
+
+    if uploaded_files:
+        cols = st.columns(min(len(uploaded_files), 4))
+        for idx, f in enumerate(uploaded_files):
+            cols[idx % len(cols)].image(f.getvalue(), width="stretch")
+
+    title = st.text_input("Title", key="shopify_title")
+    description = st.text_area("Description", key="shopify_description", height=120)
+
+    price_col, tags_col = st.columns([1, 2])
+    price = price_col.number_input("Price ($)", min_value=0.0, step=1.0, format="%.2f", key="shopify_price")
+    tags = tags_col.text_input("Tags (comma-separated)", key="shopify_tags")
+
+    status = st.radio(
+        "Status",
+        options=["draft", "active"],
+        format_func=lambda s: "Draft (review in Shopify before publishing)" if s == "draft" else "Active (goes live immediately)",
+        key="shopify_status",
+    )
+
+    if st.button("🛒 Push to Shopify", type="primary", key="shopify_publish_button"):
+        if not uploaded_files:
+            st.error("Add at least one image.")
+        elif not title.strip():
+            st.error("Title is required.")
+        elif price <= 0:
+            st.error("Price must be greater than $0.")
+        else:
+            images = [(f.name, f.getvalue()) for f in uploaded_files]
+            try:
+                with st.spinner("Publishing to Shopify..."):
+                    product, admin_url = shopify_publish.create_product(
+                        shop_domain,
+                        access_token,
+                        title=title.strip(),
+                        description=description.strip(),
+                        price=price,
+                        tags=tags.strip(),
+                        images=images,
+                        status=status,
+                    )
+                st.success(f"Published '{product['title']}' as {status}.")
+                st.markdown(f"[View in Shopify admin]({admin_url})")
+            except shopify_publish.ShopifyPublishError as e:
+                st.error(str(e))
+    else:
+        if not uploaded_files:
+            st.info("Upload one or more images to get started.")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 theme.eyebrow("POSTER TOOLS · UTILITIES")
 st.title("Print & mockup toolkit")
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🪵 Wood Mockup", "📐 Resize for Print", "🖼️ Framed Mockup", "🗂️ Poster Catalog"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🪵 Wood Mockup", "📐 Resize for Print", "🖼️ Framed Mockup", "🗂️ Poster Catalog", "🛒 Shopify Listings"]
 )
 
 with tab1:
@@ -618,3 +789,6 @@ with tab3:
 
 with tab4:
     catalog_tab()
+
+with tab5:
+    shopify_tab()
