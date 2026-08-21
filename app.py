@@ -183,40 +183,64 @@ def wood_mockup_tab():
 # ---------------------------------------------------------------------------
 # Tab 2: Resize for Print
 # ---------------------------------------------------------------------------
-RESIZE_BATCH_SIZE = 20
+# Batches are capped by BOTH a max image count and a max total raw upload
+# size, whichever is hit first — a handful of very large source files
+# closes a batch out well before 20 count would. The size cap is
+# calibrated from real measurements (see memory_guard.py): ~50 realistic
+# ~3.6MB source photos stayed safely within the app's memory budget, so
+# 150MB of raw uploads per batch leaves margin below that.
+RESIZE_MAX_IMAGES_PER_BATCH = 20
+RESIZE_MAX_RAW_MB_PER_BATCH = 150
 
 
-def _resize_num_batches(total):
-    return math.ceil(total / RESIZE_BATCH_SIZE)
+def _compute_resize_batches(sizes_bytes):
+    """sizes_bytes: each uploaded file's raw byte size, in upload order.
+    Returns [{"start", "end", "count", "raw_mb"}, ...]. A batch closes
+    right before adding the next file would exceed either cap; always
+    keeps at least one file per batch even if that file alone is over the
+    size cap."""
+    max_bytes = RESIZE_MAX_RAW_MB_PER_BATCH * 1_000_000
+    bounds = []
+    start = 0
+    running = 0
+    for i, size in enumerate(sizes_bytes):
+        count_in_batch = i - start
+        if count_in_batch > 0 and (
+            count_in_batch >= RESIZE_MAX_IMAGES_PER_BATCH or running + size > max_bytes
+        ):
+            bounds.append((start, i))
+            start = i
+            running = 0
+        running += size
+    bounds.append((start, len(sizes_bytes)))
+
+    return [
+        {"start": s, "end": e, "count": e - s, "raw_mb": sum(sizes_bytes[s:e]) / 1_000_000}
+        for s, e in bounds
+    ]
 
 
-def _resize_batch_bounds(total, batch_idx):
-    start = batch_idx * RESIZE_BATCH_SIZE
-    return start, min(start + RESIZE_BATCH_SIZE, total)
-
-
-def _resize_active_batch_idx(queue, total):
+def _resize_active_batch_idx(queue, batches):
     """Index of the first batch that still has a waiting image, or None if
-    every image has been attempted (done or failed)."""
-    for b in range(_resize_num_batches(total)):
-        start, end = _resize_batch_bounds(total, b)
-        if any(queue[i]["status"] == "waiting" for i in range(start, end)):
+    every image in every batch has been attempted (done or failed)."""
+    for b, meta in enumerate(batches):
+        if any(queue[i]["status"] == "waiting" for i in range(meta["start"], meta["end"])):
             return b
     return None
 
 
-def _resize_batch_label(batch_idx, num_batches, items):
+def _resize_batch_state(items, downloaded):
+    if downloaded:
+        return "Downloaded"
     statuses = [it["status"] for it in items]
     if any(s == "processing" for s in statuses):
-        state = "Processing"
-    elif all(s == "waiting" for s in statuses):
-        state = "Waiting"
-    elif any(s == "waiting" for s in statuses):
-        state = "Paused"
-    else:
-        failed = sum(1 for s in statuses if s == "failed")
-        state = f"Completed — {failed} failed" if failed else "Completed"
-    return f"Batch {batch_idx + 1} of {num_batches} — {state}"
+        return "Processing"
+    if all(s == "waiting" for s in statuses):
+        return "Waiting"
+    if any(s == "waiting" for s in statuses):
+        return "Paused"
+    failed = sum(1 for s in statuses if s == "failed")
+    return f"Ready — {failed} failed" if failed else "Ready"
 
 
 def resize_tab():
@@ -228,8 +252,9 @@ def resize_tab():
         "fit edge-to-edge rather than cropped or padded. If a source "
         "image is too low-res for a crisp print at that size, it's "
         "automatically upscaled and lightly sharpened — and flagged below "
-        "so you know which ones to double check. Big uploads are processed "
-        f"automatically in batches of {RESIZE_BATCH_SIZE}, one after another."
+        "so you know which ones to double check. Big uploads are split "
+        "automatically into independent batches — each batch downloads "
+        "separately, and its data is cleared from memory right after."
     )
 
     size_key = st.radio(
@@ -255,6 +280,7 @@ def resize_tab():
     if uploaded_files:
         st.write(f"{len(uploaded_files)} image(s) ready.")
         if st.button("Start processing", type="primary", key="resize_start"):
+            sizes = [len(uf.getvalue()) for uf in uploaded_files]
             st.session_state["resize_queue"] = [
                 {
                     "name": uf.name,
@@ -267,12 +293,12 @@ def resize_tab():
                 }
                 for uf in uploaded_files
             ]
+            st.session_state["resize_batches"] = _compute_resize_batches(sizes)
+            st.session_state["resize_batch_downloaded"] = {}
             st.session_state["resize_locked_size_key"] = size_key
             st.session_state["resize_locked_quality"] = quality
             st.session_state["resize_active"] = True
             st.session_state["resize_paused_for_memory"] = False
-            st.session_state.pop("resize_zip_bytes", None)
-            st.session_state.pop("resize_pdf_bytes", None)
             st.rerun()
 
     queue = st.session_state.get("resize_queue")
@@ -284,13 +310,17 @@ def resize_tab():
     used_size_key = st.session_state["resize_locked_size_key"]
     used_quality = st.session_state["resize_locked_quality"]
     total = len(queue)
-    num_batches = _resize_num_batches(total)
-    active_batch_idx = _resize_active_batch_idx(queue, total)
+    batches = st.session_state["resize_batches"]
+    num_batches = len(batches)
+    downloaded_map = st.session_state["resize_batch_downloaded"]
+    active_batch_idx = _resize_active_batch_idx(queue, batches)
 
     # ---- persistent status: render the current state first, every run,
     # before doing any further processing below — this is what makes each
     # batch's completion actually visible in the browser instead of the
-    # UI jumping straight from "started" to "all done". ----
+    # UI jumping straight from "started" to "all done". Status (done/
+    # failed) is never cleared even after a batch's bytes are purged post-
+    # download, so these totals stay accurate for the whole job. ----
     done_count = sum(1 for it in queue if it["status"] == "done")
     failed_count = sum(1 for it in queue if it["status"] == "failed")
 
@@ -302,7 +332,7 @@ def resize_tab():
     if st.session_state.get("resize_paused_for_memory"):
         st.error(
             "Paused — this batch was approaching the app's memory limit. "
-            "Download what's finished below, then click Resume to continue "
+            "Download whatever's ready below, then click Resume to continue "
             "with the rest."
         )
         if st.button("▶️ Resume", key="resize_resume"):
@@ -310,11 +340,20 @@ def resize_tab():
             st.session_state["resize_paused_for_memory"] = False
             st.rerun()
 
-    for b in range(num_batches):
-        start, end = _resize_batch_bounds(total, b)
-        batch_items = queue[start:end]
-        label = _resize_batch_label(b, num_batches, batch_items)
+    for b, meta in enumerate(batches):
+        batch_items = queue[meta["start"]:meta["end"]]
+        downloaded = downloaded_map.get(b, False)
+        state = _resize_batch_state(batch_items, downloaded)
+        label = (
+            f"Batch {b + 1} of {num_batches} — {state} "
+            f"({meta['count']} images, {meta['raw_mb']:.0f}MB)"
+        )
+
         with st.expander(label, expanded=(b == active_batch_idx)):
+            if downloaded:
+                st.caption("Downloaded — this batch's files have been cleared from memory.")
+                continue
+
             for item in batch_items:
                 icon = {"waiting": "⏳", "processing": "⚙️", "done": "✅", "failed": "❌"}[item["status"]]
                 line = f"{icon} {item['name']}"
@@ -324,79 +363,95 @@ def resize_tab():
                     line += f" — upscaled {item['factor']:.1f}x, may look soft when printed"
                 st.markdown(line)
 
-    if failed_count and not st.session_state.get("resize_active"):
-        if st.button(f"🔁 Retry {failed_count} failed image(s)", key="resize_retry"):
-            for item in queue:
-                if item["status"] == "failed":
-                    item["status"] = "waiting"
-                    item["error"] = None
-            st.session_state["resize_active"] = True
-            st.session_state["resize_paused_for_memory"] = False
-            st.rerun()
+            batch_failed = sum(1 for it in batch_items if it["status"] == "failed")
+            batch_fully_attempted = all(it["status"] in ("done", "failed") for it in batch_items)
 
-    # done images are available to download as soon as any exist, even
-    # mid-batch, so nothing already finished is ever stuck waiting on the
-    # rest of a big queue
-    done_items = [(it["out_name"], it["out_bytes"]) for it in queue if it["status"] == "done"]
-    if done_items:
-        # ZIP and PDF are built lazily, one at a time, on request, and
-        # preparing one evicts the other — holding both cached at once
-        # roughly doubles this step's memory cost for no benefit.
-        dl_col1, dl_col2 = st.columns(2)
+            if batch_failed and batch_fully_attempted and not st.session_state.get("resize_active"):
+                if st.button(f"🔁 Retry {batch_failed} failed in this batch", key=f"resize_retry_{b}"):
+                    for it in batch_items:
+                        if it["status"] == "failed":
+                            it["status"] = "waiting"
+                            it["error"] = None
+                    st.session_state["resize_active"] = True
+                    st.session_state["resize_paused_for_memory"] = False
+                    st.rerun()
 
-        with dl_col1:
-            if "resize_zip_bytes" in st.session_state:
-                st.download_button(
-                    "⬇️ Download all as ZIP",
-                    data=st.session_state["resize_zip_bytes"],
-                    file_name=f"resized_{used_size_key}.zip",
-                    mime="application/zip",
-                    type="primary",
-                    key="resize_download",
-                    width="stretch",
-                )
-            elif st.button("📦 Prepare ZIP", key="resize_prep_zip", width="stretch"):
-                st.session_state.pop("resize_pdf_bytes", None)
-                st.session_state["resize_zip_bytes"] = build_zip(done_items).getvalue()
-                st.rerun()
+            batch_done_items = [(it["out_name"], it["out_bytes"]) for it in batch_items if it["status"] == "done"]
+            if batch_fully_attempted and batch_done_items:
+                # ZIP and PDF are mutually exclusive on purpose — this batch
+                # is a small, bounded chunk, but downloading either format
+                # is what triggers clearing its data from memory, so once
+                # you've downloaded one, the other is no longer available
+                # for that batch.
+                zip_key = f"resize_batch_{b}_zip"
+                pdf_key = f"resize_batch_{b}_pdf"
+                dl_col1, dl_col2 = st.columns(2)
 
-        with dl_col2:
-            if "resize_pdf_bytes" in st.session_state:
-                st.download_button(
-                    "⬇️ Download all as PDF",
-                    data=st.session_state["resize_pdf_bytes"],
-                    file_name=f"resized_{used_size_key}_print_batch.pdf",
-                    mime="application/pdf",
-                    key="resize_download_pdf",
-                    width="stretch",
-                )
-            elif st.button("📄 Prepare PDF", key="resize_prep_pdf", width="stretch"):
-                st.session_state.pop("resize_zip_bytes", None)
-                st.session_state["resize_pdf_bytes"] = build_pdf(done_items).getvalue()
-                st.rerun()
+                def _purge_batch():
+                    for it in batch_items:
+                        it["out_bytes"] = None
+                        it["raw"] = None
+                    st.session_state.pop(zip_key, None)
+                    st.session_state.pop(pdf_key, None)
+                    downloaded_map[b] = True
 
-        if len(done_items) > 35:
-            st.caption(
-                "Large batch — preparing ZIP or PDF replaces whichever one was "
-                "previously ready, to keep memory usage safe. Download one before "
-                "preparing the other if you need both."
-            )
+                with dl_col1:
+                    if zip_key in st.session_state:
+                        if st.download_button(
+                            f"⬇️ Download Batch {b + 1} ZIP",
+                            data=st.session_state[zip_key],
+                            file_name=f"resized_batch{b + 1}_{used_size_key}.zip",
+                            mime="application/zip",
+                            type="primary",
+                            key=f"resize_dl_zip_{b}",
+                            width="stretch",
+                        ):
+                            _purge_batch()
+                            st.rerun()
+                    elif pdf_key not in st.session_state and st.button(
+                        "📦 Prepare ZIP", key=f"resize_prep_zip_{b}", width="stretch"
+                    ):
+                        st.session_state[zip_key] = build_zip(batch_done_items).getvalue()
+                        st.rerun()
 
-        st.write("Preview:")
-        cols = st.columns(3)
-        for idx, (name, data) in enumerate(done_items[:9]):
-            cols[idx % 3].image(data, caption=name, width="stretch")
-        if len(done_items) > 9:
-            st.caption(f"...and {len(done_items) - 9} more in the zip.")
+                with dl_col2:
+                    if pdf_key in st.session_state:
+                        if st.download_button(
+                            f"⬇️ Download Batch {b + 1} PDF",
+                            data=st.session_state[pdf_key],
+                            file_name=f"resized_batch{b + 1}_{used_size_key}_print.pdf",
+                            mime="application/pdf",
+                            key=f"resize_dl_pdf_{b}",
+                            width="stretch",
+                        ):
+                            _purge_batch()
+                            st.rerun()
+                    elif zip_key not in st.session_state and st.button(
+                        "📄 Prepare PDF", key=f"resize_prep_pdf_{b}", width="stretch"
+                    ):
+                        st.session_state[pdf_key] = build_pdf(batch_done_items).getvalue()
+                        st.rerun()
+
+                preview_cols = st.columns(3)
+                for idx, (name, data) in enumerate(batch_done_items[:6]):
+                    preview_cols[idx % 3].image(data, caption=name, width="stretch")
+                if len(batch_done_items) > 6:
+                    st.caption(f"...and {len(batch_done_items) - 6} more in this batch.")
+            elif batch_fully_attempted:
+                st.caption("Every image in this batch failed — nothing to download. Retry above.")
 
     # ---- process the next pending batch, if we're actively running, then
     # loop back around via rerun so the status above reflects it before
-    # the following batch starts. ----
+    # the following batch starts. Each batch gets its own fresh memory
+    # budget baseline, and only ever holds its own images — never the
+    # whole queue — so batch 2 never has to coexist with batch 1's data
+    # unless batch 1 hasn't been downloaded yet. ----
     if st.session_state.get("resize_active"):
         if active_batch_idx is None:
             st.session_state["resize_active"] = False
         else:
-            start, end = _resize_batch_bounds(total, active_batch_idx)
+            meta = batches[active_batch_idx]
+            start, end = meta["start"], meta["end"]
             live_status = st.empty()
             budget = memory_guard.BatchBudget()
             paused = False
